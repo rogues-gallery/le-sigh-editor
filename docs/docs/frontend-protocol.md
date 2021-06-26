@@ -79,7 +79,7 @@ will receive a `theme_changed` notification.
 ### set_language
 `set_language {"view-id":"view-id-1", "language_id":"Rust"}`
 
-Asks core to change the language of the buffer associated with the `view_id`.
+Asks core to change the language of the buffer associated with the `view_id`. You need the syntect plugin for this to work.
 If the change succeeds the client will receive a `language_changed` notification.
 
 ### modify_user_config
@@ -553,9 +553,10 @@ in more detail below. For this op, `n` must equal `lines.length` (alternative:
 make n optional in this case). It does not update `old_ix`.
 
 The "update" op updates the cursor and/or style of n existing lines. As in
-"ins", n must equal lines.length. It also increments `old_ix` by `n`.
-
-**Note:** The "update" op is not currently used by core.
+"ins", n must equal lines.length. It also increments `old_ix` by `n`. If the
+update modifies the line numbers of the given n lines, the `ln` parameter
+representing the new logical line number of the first line (as in the "copy"
+op) should be present.
 
 In all cases, n is guaranteed positive and nonzero (as a consequence, any line
 present in the old state is copied at most once to the new state).

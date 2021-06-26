@@ -423,7 +423,7 @@ where
 impl Sample {
     fn thread_name() -> Option<StrCow> {
         let thread = std::thread::current();
-        thread.name().map(|ref s| to_cow_str(s.to_string()))
+        thread.name().map(|ref s| to_cow_str((*s).to_string()))
     }
 
     /// Constructs a Begin or End sample.  Should not be used directly.  Instead
@@ -599,7 +599,7 @@ impl<'a> Drop for SampleGuard<'a> {
 /// None if an irrecoverable error occured.
 fn exe_name() -> Option<String> {
     match std::env::current_exe() {
-        Ok(exe_name) => match exe_name.clone().file_name() {
+        Ok(exe_name) => match exe_name.file_name() {
             Some(filename) => filename.to_str().map(ToString::to_string),
             None => {
                 let full_path = exe_name.into_os_string();

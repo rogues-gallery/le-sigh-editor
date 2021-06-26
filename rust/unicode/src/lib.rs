@@ -13,10 +13,20 @@
 // limitations under the License.
 
 //! Unicode utilities useful for text editing, including a line breaking iterator.
+#![no_std]
+
+extern crate alloc;
+
 mod tables;
+
+use core::cmp::Ordering;
 
 use crate::tables::*;
 
+/// The Unicode line breaking property of the given code point.
+///
+/// This is given as a numeric value which matches the ULineBreak
+/// enum value from ICU.
 pub fn linebreak_property(cp: char) -> u8 {
     let cp = cp as usize;
     if cp < 0x800 {
@@ -31,8 +41,11 @@ pub fn linebreak_property(cp: char) -> u8 {
     }
 }
 
-// Return property, length
-// May panic if ix doesn't point to a valid character in the string
+/// The Unicode line breaking property of the given code point.
+///
+/// Look up the line breaking property for the first code point in the
+/// string. Return the property as a numeric value, and also the utf-8
+/// length of the codepoint, for convenience.
 pub fn linebreak_property_str(s: &str, ix: usize) -> (u8, usize) {
     let b = s.as_bytes()[ix];
     if b < 0x80 {
@@ -59,6 +72,11 @@ pub fn linebreak_property_str(s: &str, ix: usize) -> (u8, usize) {
 /// An iterator which produces line breaks according to the UAX 14 line
 /// breaking algorithm. For each break, return a tuple consisting of the offset
 /// within the source string and a bool indicating whether it's a hard break.
+///
+/// There is never a break at the beginning of the string (thus, the empty string
+/// produces no breaks). For non-empty strings, there is always a break at the
+/// end. It is indicated as a hard break when the string is terminated with a
+/// newline or other Unicode explicit line-end character.
 #[derive(Copy, Clone)]
 pub struct LineBreakIterator<'a> {
     s: &'a str,
@@ -72,25 +90,32 @@ impl<'a> Iterator for LineBreakIterator<'a> {
     // return break pos and whether it's a hard break
     fn next(&mut self) -> Option<(usize, bool)> {
         loop {
-            if self.ix > self.s.len() {
-                return None;
-            } else if self.ix == self.s.len() {
-                // LB3, break at EOT
-                self.ix += 1;
-                return Some((self.s.len(), true));
-            }
-            let (lb, len) = linebreak_property_str(self.s, self.ix);
-            let i = (self.state as usize) * N_LINEBREAK_CATEGORIES + (lb as usize);
-            let new = LINEBREAK_STATE_MACHINE[i];
-            //println!("\"{}\"[{}], state {} + lb {} -> {}", &self.s[self.ix..], self.ix, self.state, lb, new);
-            let result = self.ix;
-            self.ix += len;
-            if (new as i8) < 0 {
-                // break found
-                self.state = new & 0x3f;
-                return Some((result, new >= 0xc0));
-            } else {
-                self.state = new;
+            match self.ix.cmp(&self.s.len()) {
+                Ordering::Greater => {
+                    return None;
+                }
+                Ordering::Equal => {
+                    // LB3, break at EOT
+                    self.ix += 1;
+                    let i = (self.state as usize) * N_LINEBREAK_CATEGORIES;
+                    let new = LINEBREAK_STATE_MACHINE[i];
+                    return Some((self.s.len(), new >= 0xc0));
+                }
+                Ordering::Less => {
+                    let (lb, len) = linebreak_property_str(self.s, self.ix);
+                    let i = (self.state as usize) * N_LINEBREAK_CATEGORIES + (lb as usize);
+                    let new = LINEBREAK_STATE_MACHINE[i];
+                    //println!("{:?}[{}], state {} + lb {} -> {}", &self.s[self.ix..], self.ix, self.state, lb, new);
+                    let result = self.ix;
+                    self.ix += len;
+                    if (new as i8) < 0 {
+                        // break found
+                        self.state = new & 0x3f;
+                        return Some((result, new >= 0xc0));
+                    } else {
+                        self.state = new;
+                    }
+                }
             }
         }
     }
@@ -112,14 +137,14 @@ impl<'a> LineBreakIterator<'a> {
     }
 }
 
-/// A class (TODO, not right word) useful for computing line breaks in a rope or
-/// other non-contiguous string representation. This is a trickier problem than
-/// iterating in a string for a few reasons, the trickiest of which is that in
-/// the general case, line breaks require an indeterminate amount of look-behind.
+/// A struct useful for computing line breaks in a rope or other non-contiguous
+/// string representation. This is a trickier problem than iterating in a string
+/// for a few reasons, the trickiest of which is that in the general case,
+/// line breaks require an indeterminate amount of look-behind.
 ///
 /// This is something of an "expert-level" interface, and should only be used if
 /// the caller is prepared to respect all the invariants. Otherwise, you might
-/// get inconsistent breaks depending on start positiona and leaf boundaries.
+/// get inconsistent breaks depending on start position and leaf boundaries.
 #[derive(Copy, Clone)]
 pub struct LineBreakLeafIter {
     ix: usize,
@@ -175,7 +200,7 @@ impl LineBreakLeafIter {
     }
 }
 
-fn is_in_asc_list<T: std::cmp::PartialOrd>(c: T, list: &[T], start: usize, end: usize) -> bool {
+fn is_in_asc_list<T: core::cmp::PartialOrd>(c: T, list: &[T], start: usize, end: usize) -> bool {
     if c == list[start] || c == list[end] {
         return true;
     }
@@ -193,9 +218,10 @@ fn is_in_asc_list<T: std::cmp::PartialOrd>(c: T, list: &[T], start: usize, end: 
 }
 
 pub fn is_variation_selector(c: char) -> bool {
-    (c >= '\u{FE00}' && c <= '\u{FE0F}') || (c >= '\u{E0100}' && c <= '\u{E01EF}')
+    ('\u{FE00}'..='\u{FE0F}').contains(&c) || ('\u{E0100}'..='\u{E01EF}').contains(&c)
 }
 
+#[allow(clippy::wrong_self_convention)] // clippy wants &self for all of these
 pub trait EmojiExt {
     fn is_regional_indicator_symbol(self) -> bool;
     fn is_emoji_modifier(self) -> bool;
@@ -209,10 +235,10 @@ pub trait EmojiExt {
 
 impl EmojiExt for char {
     fn is_regional_indicator_symbol(self) -> bool {
-        self >= '\u{1F1E6}' && self <= '\u{1F1FF}'
+        ('\u{1F1E6}'..='\u{1F1FF}').contains(&self)
     }
     fn is_emoji_modifier(self) -> bool {
-        self >= '\u{1F3FB}' && self <= '\u{1F3FF}'
+        ('\u{1F3FB}'..='\u{1F3FF}').contains(&self)
     }
     fn is_emoji_combining_enclosing_keycap(self) -> bool {
         self == '\u{20E3}'
@@ -224,7 +250,7 @@ impl EmojiExt for char {
         is_in_asc_list(self, &EMOJI_MODIFIER_BASE_TABLE, 0, EMOJI_MODIFIER_BASE_TABLE.len() - 1)
     }
     fn is_tag_spec_char(self) -> bool {
-        '\u{E0020}' <= self && self <= '\u{E007E}'
+        ('\u{E0020}'..='\u{E007E}').contains(&self)
     }
     fn is_emoji_cancel_tag(self) -> bool {
         self == '\u{E007F}'
@@ -235,7 +261,7 @@ impl EmojiExt for char {
 }
 
 pub fn is_keycap_base(c: char) -> bool {
-    ('0' <= c && c <= '9') || c == '#' || c == '*'
+    ('0'..='9').contains(&c) || c == '#' || c == '*'
 }
 
 #[cfg(test)]
@@ -243,6 +269,8 @@ mod tests {
     use crate::linebreak_property;
     use crate::linebreak_property_str;
     use crate::LineBreakIterator;
+    use alloc::vec;
+    use alloc::vec::*;
 
     #[test]
     fn linebreak_prop() {
@@ -313,7 +341,7 @@ mod tests {
         assert_eq!(19, linebreak_property('\u{1091}'));
         assert_eq!(19, linebreak_property('\u{1B53}'));
         assert_eq!(2, linebreak_property('\u{1EEA}'));
-        assert_eq!(40, linebreak_property('\u{200D}'));
+        assert_eq!(42, linebreak_property('\u{200D}'));
         assert_eq!(14, linebreak_property('\u{30C7}'));
         assert_eq!(14, linebreak_property('\u{318B}'));
         assert_eq!(14, linebreak_property('\u{3488}'));
@@ -441,7 +469,7 @@ mod tests {
         assert_eq!((9, 2), linebreak_property_str(&"\u{07A6}", 0));
         assert_eq!((0, 2), linebreak_property_str(&"\u{07B9}", 0));
         assert_eq!((2, 3), linebreak_property_str(&"\u{131F}", 0));
-        assert_eq!((40, 3), linebreak_property_str(&"\u{200D}", 0));
+        assert_eq!((42, 3), linebreak_property_str(&"\u{200D}", 0));
         assert_eq!((2, 3), linebreak_property_str(&"\u{25DA}", 0));
         assert_eq!((2, 3), linebreak_property_str(&"\u{2C01}", 0));
         assert_eq!((14, 3), linebreak_property_str(&"\u{2EE5}", 0));
@@ -475,8 +503,8 @@ mod tests {
         assert_eq!((2, 3), linebreak_property_str(&"\u{FEC3}", 0));
         assert_eq!((0, 4), linebreak_property_str(&"\u{13CC5}", 0));
         assert_eq!((2, 4), linebreak_property_str(&"\u{1D945}", 0));
-        assert_eq!((41, 4), linebreak_property_str(&"\u{1F3C3}", 0));
-        assert_eq!((42, 4), linebreak_property_str(&"\u{1F3FB}", 0));
+        assert_eq!((40, 4), linebreak_property_str(&"\u{1F3C3}", 0));
+        assert_eq!((41, 4), linebreak_property_str(&"\u{1F3FB}", 0));
         assert_eq!((14, 4), linebreak_property_str(&"\u{2BDCD}", 0));
         assert_eq!((14, 4), linebreak_property_str(&"\u{3898E}", 0));
         assert_eq!((0, 4), linebreak_property_str(&"\u{45C35}", 0));
@@ -512,15 +540,18 @@ mod tests {
     #[test]
     fn lb_iter_simple() {
         assert_eq!(
-            vec![(6, false), (11, true)],
+            vec![(6, false), (11, false)],
             LineBreakIterator::new("hello world").collect::<Vec<_>>()
         );
 
         // LB7, LB18
-        assert_eq!(vec![(3, false), (4, true)], LineBreakIterator::new("a  b").collect::<Vec<_>>());
+        assert_eq!(
+            vec![(3, false), (4, false)],
+            LineBreakIterator::new("a  b").collect::<Vec<_>>()
+        );
 
         // LB5
-        assert_eq!(vec![(2, true), (3, true)], LineBreakIterator::new("a\nb").collect::<Vec<_>>());
+        assert_eq!(vec![(2, true), (3, false)], LineBreakIterator::new("a\nb").collect::<Vec<_>>());
         assert_eq!(
             vec![(2, true), (4, true)],
             LineBreakIterator::new("\r\n\r\n").collect::<Vec<_>>()
@@ -528,53 +559,63 @@ mod tests {
 
         // LB8a
         assert_eq!(
-            vec![(7, true)],
+            vec![(7, false)],
             LineBreakIterator::new("\u{200D}\u{1F3FB}").collect::<Vec<_>>()
         );
 
         // LB10 combining mark after space
         assert_eq!(
-            vec![(2, false), (4, true)],
+            vec![(2, false), (4, false)],
             LineBreakIterator::new("a \u{301}").collect::<Vec<_>>()
         );
 
         // LB15
-        assert_eq!(vec![(3, true)], LineBreakIterator::new("\" [").collect::<Vec<_>>());
+        assert_eq!(vec![(3, false)], LineBreakIterator::new("\" [").collect::<Vec<_>>());
 
         // LB17
         assert_eq!(
-            vec![(2, false), (10, false), (11, true)],
+            vec![(2, false), (10, false), (11, false)],
             LineBreakIterator::new("a \u{2014} \u{2014} c").collect::<Vec<_>>()
         );
 
         // LB18
         assert_eq!(
-            vec![(2, false), (6, false), (7, true)],
+            vec![(2, false), (6, false), (7, false)],
             LineBreakIterator::new("a \"b\" c").collect::<Vec<_>>()
         );
 
         // LB21
-        assert_eq!(vec![(2, false), (3, true)], LineBreakIterator::new("a-b").collect::<Vec<_>>());
+        assert_eq!(vec![(2, false), (3, false)], LineBreakIterator::new("a-b").collect::<Vec<_>>());
 
         // LB21a
         assert_eq!(
-            vec![(5, true)],
+            vec![(5, false)],
             LineBreakIterator::new("\u{05D0}-\u{05D0}").collect::<Vec<_>>()
         );
 
         // LB23a
-        assert_eq!(vec![(6, true)], LineBreakIterator::new("$\u{1F3FB}%").collect::<Vec<_>>());
+        assert_eq!(vec![(6, false)], LineBreakIterator::new("$\u{1F3FB}%").collect::<Vec<_>>());
 
         // LB30b
         assert_eq!(
-            vec![(8, true)],
+            vec![(8, false)],
             LineBreakIterator::new("\u{1F466}\u{1F3FB}").collect::<Vec<_>>()
         );
 
         // LB31
         assert_eq!(
-            vec![(8, false), (16, true)],
+            vec![(8, false), (16, false)],
             LineBreakIterator::new("\u{1F1E6}\u{1F1E6}\u{1F1E6}\u{1F1E6}").collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    // The final break is hard only when there is an explicit separator.
+    fn lb_iter_eot() {
+        assert_eq!(vec![(4, false)], LineBreakIterator::new("abc ").collect::<Vec<_>>());
+
+        assert_eq!(vec![(4, true)], LineBreakIterator::new("abc\r").collect::<Vec<_>>());
+
+        assert_eq!(vec![(5, true)], LineBreakIterator::new("abc\u{0085}").collect::<Vec<_>>());
     }
 }

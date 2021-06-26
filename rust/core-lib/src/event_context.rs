@@ -36,6 +36,7 @@ use crate::config::{BufferItems, Table};
 use crate::edit_types::{EventDomain, SpecialEvent};
 use crate::editor::Editor;
 use crate::file::FileInfo;
+use crate::line_offset::LineOffset;
 use crate::plugins::Plugin;
 use crate::recorder::Recorder;
 use crate::selection::InsertDrift;
@@ -384,9 +385,17 @@ impl<'a> EventContext<'a> {
 /// requires access to particular combinations of state. We isolate such
 /// special cases here.
 impl<'a> EventContext<'a> {
+    pub(crate) fn view_init(&mut self) {
+        let wrap_width = self.config.wrap_width;
+        let word_wrap = self.config.word_wrap;
+
+        self.with_view(|view, text| view.update_wrap_settings(text, wrap_width, word_wrap));
+    }
+
     pub(crate) fn finish_init(&mut self, config: &Table) {
         if !self.plugins.is_empty() {
             let info = self.plugin_info();
+
             self.plugins.iter().for_each(|plugin| {
                 plugin.new_buffer(&info);
                 self.plugin_started(plugin);
@@ -402,7 +411,16 @@ impl<'a> EventContext<'a> {
 
         self.client.config_changed(self.view_id, config);
         self.client.language_changed(self.view_id, &self.language);
-        self.update_wrap_settings(true);
+
+        // Rewrap and request a render.
+        // This is largely similar to update_wrap_settings(), the only difference
+        // being that the view is expected to be already initialized.
+        self.rewrap();
+
+        if self.view.borrow().needs_more_wrap() {
+            self.schedule_rewrap();
+        }
+
         self.with_view(|view, text| view.set_dirty(text));
         self.render()
     }
@@ -526,10 +544,8 @@ impl<'a> EventContext<'a> {
         if !has_newline_at_eof {
             let line_ending = &self.config.line_ending;
             rope.edit(rope_len.., line_ending);
-            rope
-        } else {
-            rope
         }
+        rope
     }
 
     /// Called after anything changes that effects word wrap, such as the size of
@@ -731,6 +747,7 @@ mod tests {
             let recorder = RefCell::new(Recorder::new());
             let harness = ContextHarness { view, editor, client, core_ref, kill_ring,
                              style_map, width_cache, config_manager, recorder };
+            harness.make_context().view_init();
             harness.make_context().finish_init(&config);
             harness
 
@@ -1541,6 +1558,13 @@ mod tests {
 
         ctx.do_edit(EditNotification::Outdent);
         assert_eq!(harness.debug_render(),"[|    hello\n]world");
+
+        ctx.do_edit(EditNotification::SelectAll);
+        ctx.do_edit(EditNotification::DeleteBackward);
+        ctx.do_edit(EditNotification::Insert { chars: "hello".into() });
+        ctx.do_edit(EditNotification::SelectAll);
+        ctx.do_edit(EditNotification::InsertTab);
+        assert_eq!(harness.debug_render(),"    |");
     }
 
     #[test]

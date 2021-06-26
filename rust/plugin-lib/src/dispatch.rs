@@ -86,7 +86,7 @@ impl<'a, P: 'a + Plugin> Dispatcher<'a, P> {
         let v = bail!(self.views.get_mut(&view_id), "did_save", self.pid, view_id);
         let prev_path = v.path.take();
         v.path = Some(path);
-        self.plugin.did_save(v, prev_path.as_ref().map(PathBuf::as_path));
+        self.plugin.did_save(v, prev_path.as_deref());
     }
 
     fn do_config_changed(&mut self, view_id: ViewId, changes: &ConfigTable) {
@@ -149,7 +149,7 @@ impl<'a, P: 'a + Plugin> Dispatcher<'a, P> {
         } else {
             xi_trace::disable_tracing();
             info!("Disabling tracing in global plugin {:?}", self.pid);
-            trace("enable tracing", &["plugin"]);
+            trace("disable tracing", &["plugin"]);
         }
     }
 

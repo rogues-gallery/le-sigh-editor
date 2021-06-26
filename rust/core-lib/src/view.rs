@@ -11,7 +11,6 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![allow(clippy::range_plus_one)]
 
 use std::cell::RefCell;
 use std::cmp::{max, min};
@@ -25,6 +24,7 @@ use crate::client::{Client, Update, UpdateOp};
 use crate::edit_types::ViewEvent;
 use crate::find::{Find, FindStatus};
 use crate::line_cache_shadow::{self, LineCacheShadow, RenderPlan, RenderTactic};
+use crate::line_offset::LineOffset;
 use crate::linewrap::{InvalLines, Lines, VisualLine, WrapWidth};
 use crate::movement::{region_movement, selection_movement, Movement};
 use crate::plugins::PluginId;
@@ -46,6 +46,8 @@ const FLAG_SELECT: u64 = 2;
 /// Size of batches as number of bytes used during incremental find.
 const FIND_BATCH_SIZE: usize = 500000;
 
+/// A view to a buffer. It is the buffer plus additional information
+/// like line breaks and selection state.
 pub struct View {
     view_id: ViewId,
     buffer_id: BufferId,
@@ -190,6 +192,10 @@ impl View {
         self.view_id
     }
 
+    pub(crate) fn get_lines(&self) -> &Lines {
+        &self.lines
+    }
+
     pub(crate) fn get_replace(&self) -> Option<Replace> {
         self.replace.clone()
     }
@@ -225,11 +231,7 @@ impl View {
     }
 
     pub(crate) fn find_in_progress(&self) -> bool {
-        match self.find_progress {
-            FindProgress::InProgress(_) => true,
-            FindProgress::Started => true,
-            _ => false,
-        }
+        matches!(self.find_progress, FindProgress::InProgress(_) | FindProgress::Started)
     }
 
     pub(crate) fn do_edit(&mut self, text: &Rope, cmd: ViewEvent) {
@@ -244,7 +246,7 @@ impl View {
             Gesture { line, col, ty } => self.do_gesture(text, line, col, ty),
             GotoLine { line } => self.goto_line(text, line),
             Find { chars, case_sensitive, regex, whole_words } => {
-                let id = self.find.first().and_then(|q| Some(q.id()));
+                let id = self.find.first().map(|q| q.id());
                 let query_changes = FindQuery { id, chars, case_sensitive, regex, whole_words };
                 self.set_find(text, [query_changes].to_vec())
             }
@@ -367,7 +369,8 @@ impl View {
     /// of individual region movements become carets.
     pub fn do_move(&mut self, text: &Rope, movement: Movement, modify: bool) {
         self.drag_state = None;
-        let new_sel = selection_movement(movement, &self.selection, self, text, modify);
+        let new_sel =
+            selection_movement(movement, &self.selection, self, self.scroll_height(), text, modify);
         self.set_selection(text, new_sel);
     }
 
@@ -411,7 +414,8 @@ impl View {
         let mut sel = Selection::new();
         for &region in self.sel_regions() {
             sel.add_region(region);
-            let new_region = region_movement(movement, region, self, &text, false);
+            let new_region =
+                region_movement(movement, region, self, self.scroll_height(), &text, false);
             sel.add_region(new_region);
         }
         self.set_selection(text, sel);
@@ -604,28 +608,30 @@ impl View {
         !self.selection.regions_in_range(offset, offset).is_empty()
     }
 
-    // Render a single line, and advance cursors to next line.
-    fn render_line(
+    // Encode a single line with its styles and cursors in JSON.
+    // If "text" is not specified, don't add "text" to the output.
+    // If "style_spans" are not specified, don't add "styles" to the output.
+    fn encode_line(
         &self,
         client: &Client,
         styles: &StyleMap,
-        text: &Rope,
         line: VisualLine,
-        style_spans: &Spans<Style>,
-        line_num: usize,
+        text: Option<&Rope>,
+        style_spans: Option<&Spans<Style>>,
+        last_pos: usize,
     ) -> Value {
         let start_pos = line.interval.start;
         let pos = line.interval.end;
-        let l_str = text.slice_to_cow(start_pos..pos);
         let mut cursors = Vec::new();
         let mut selections = Vec::new();
         for region in self.selection.regions_in_range(start_pos, pos) {
             // cursor
             let c = region.end;
+
             if (c > start_pos && c < pos)
                 || (!region.is_upstream() && c == start_pos)
                 || (region.is_upstream() && c == pos)
-                || (c == pos && c == text.len() && self.line_of_offset(text, c) == line_num)
+                || (c == pos && c == last_pos)
             {
                 cursors.push(c - start_pos);
             }
@@ -654,14 +660,22 @@ impl View {
             }
         }
 
-        let styles =
-            self.render_styles(client, styles, start_pos, pos, &selections, &hls, style_spans);
+        let mut result = json!({});
 
-        let mut result = json!({
-            "text": &l_str,
-            "styles": styles,
-        });
-
+        if let Some(text) = text {
+            result["text"] = json!(text.slice_to_cow(start_pos..pos));
+        }
+        if let Some(style_spans) = style_spans {
+            result["styles"] = json!(self.encode_styles(
+                client,
+                styles,
+                start_pos,
+                pos,
+                &selections,
+                &hls,
+                style_spans
+            ));
+        }
         if !cursors.is_empty() {
             result["cursor"] = json!(cursors);
         }
@@ -671,7 +685,7 @@ impl View {
         result
     }
 
-    pub fn render_styles(
+    pub fn encode_styles(
         &self,
         client: &Client,
         styles: &StyleMap,
@@ -681,7 +695,7 @@ impl View {
         hls: &Vec<Vec<(usize, usize)>>,
         style_spans: &Spans<Style>,
     ) -> Vec<isize> {
-        let mut rendered_styles = Vec::new();
+        let mut encoded_styles = Vec::new();
         assert!(start <= end, "{} {}", start, end);
         let style_spans = style_spans.subseq(Interval::new(start, end));
 
@@ -691,26 +705,26 @@ impl View {
         // same span exists in both sets (as when there is an active selection)
         for (index, cur_find_hls) in hls.iter().enumerate() {
             for &(sel_start, sel_end) in cur_find_hls {
-                rendered_styles.push((sel_start as isize) - ix);
-                rendered_styles.push(sel_end as isize - sel_start as isize);
-                rendered_styles.push(index as isize + 1);
+                encoded_styles.push((sel_start as isize) - ix);
+                encoded_styles.push(sel_end as isize - sel_start as isize);
+                encoded_styles.push(index as isize + 1);
                 ix = sel_end as isize;
             }
         }
         for &(sel_start, sel_end) in sel {
-            rendered_styles.push((sel_start as isize) - ix);
-            rendered_styles.push(sel_end as isize - sel_start as isize);
-            rendered_styles.push(0);
+            encoded_styles.push((sel_start as isize) - ix);
+            encoded_styles.push(sel_end as isize - sel_start as isize);
+            encoded_styles.push(0);
             ix = sel_end as isize;
         }
         for (iv, style) in style_spans.iter() {
             let style_id = self.get_or_def_style_id(client, styles, &style);
-            rendered_styles.push((iv.start() as isize) - ix);
-            rendered_styles.push(iv.end() as isize - iv.start() as isize);
-            rendered_styles.push(style_id as isize);
+            encoded_styles.push((iv.start() as isize) - ix);
+            encoded_styles.push(iv.end() as isize - iv.start() as isize);
+            encoded_styles.push(style_id as isize);
             ix = iv.end() as isize;
         }
-        rendered_styles
+        encoded_styles
     }
 
     fn get_or_def_style_id(&self, client: &Client, style_map: &StyleMap, style: &Style) -> usize {
@@ -733,7 +747,27 @@ impl View {
         plan: &RenderPlan,
         pristine: bool,
     ) {
+        // every time current visible range changes, annotations are sent to frontend
+        let start_off = self.offset_of_line(text, self.first_line);
+        let end_off = self.offset_of_line(text, self.first_line + self.height + 2);
+        let visible_range = Interval::new(start_off, end_off);
+        let selection_annotations =
+            self.selection.get_annotations(visible_range, &self, text).to_json();
+        let find_annotations =
+            self.find.iter().map(|ref f| f.get_annotations(visible_range, &self, text).to_json());
+        let plugin_annotations =
+            self.annotations.iter_range(&self, text, visible_range).map(|a| a.to_json());
+
+        let annotations = iter::once(selection_annotations)
+            .chain(find_annotations)
+            .chain(plugin_annotations)
+            .collect::<Vec<_>>();
+
         if !self.lc_shadow.needs_render(plan) {
+            let total_lines = self.line_of_offset(text, text.len()) + 1;
+            let update =
+                Update { ops: vec![UpdateOp::copy(total_lines, 1)], pristine, annotations };
+            client.update_view(self.view_id, &update);
             return;
         }
 
@@ -761,56 +795,81 @@ impl View {
                     ops.push(UpdateOp::invalidate(seg.n));
                     b.add_span(seg.n, 0, 0);
                 }
-                RenderTactic::Preserve => {
-                    // TODO: in the case where it's ALL_VALID & !CURSOR_VALID, and cursors
-                    // are empty, could send update removing the cursor.
-                    if seg.validity == line_cache_shadow::ALL_VALID {
+                RenderTactic::Preserve | RenderTactic::Render => {
+                    // Depending on the state of TEXT_VALID, STYLES_VALID and
+                    // CURSOR_VALID, perform one of the following actions:
+                    //
+                    //   - All the three are valid => send the "copy" op
+                    //     (+leading "skip" to catch up with "ln" to update);
+                    //
+                    //   - Text and styles are valid, cursors are not => same,
+                    //     but send an "update" op instead of "copy" to move
+                    //     the cursors;
+                    //
+                    //   - Text or styles are invalid:
+                    //     => send "invalidate" if RenderTactic is "Preserve";
+                    //     => send "skip"+"insert" (recreate the lines) if
+                    //        RenderTactic is "Render".
+                    if (seg.validity & line_cache_shadow::TEXT_VALID) != 0
+                        && (seg.validity & line_cache_shadow::STYLES_VALID) != 0
+                    {
                         let n_skip = seg.their_line_num - line_num;
                         if n_skip > 0 {
                             ops.push(UpdateOp::skip(n_skip));
                         }
                         let line_offset = self.offset_of_line(text, seg.our_line_num);
-                        let logical_line = text.line_of_offset(line_offset) + 1;
-                        ops.push(UpdateOp::copy(seg.n, logical_line));
-                        b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
+                        let logical_line = text.line_of_offset(line_offset);
+                        if (seg.validity & line_cache_shadow::CURSOR_VALID) != 0 {
+                            // ALL_VALID; copy lines as-is
+                            ops.push(UpdateOp::copy(seg.n, logical_line + 1));
+                        } else {
+                            // !CURSOR_VALID; update cursors
+                            let start_line = seg.our_line_num;
+
+                            let encoded_lines = self
+                                .lines
+                                .iter_lines(text, start_line)
+                                .take(seg.n)
+                                .map(|l| {
+                                    self.encode_line(
+                                        client,
+                                        styles,
+                                        l,
+                                        /* text = */ None,
+                                        /* style_spans = */ None,
+                                        text.len(),
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+
+                            let logical_line_opt =
+                                if logical_line == 0 { None } else { Some(logical_line + 1) };
+                            ops.push(UpdateOp::update(encoded_lines, logical_line_opt));
+                        }
+                        b.add_span(seg.n, seg.our_line_num, seg.validity);
                         line_num = seg.their_line_num + seg.n;
-                    } else {
+                    } else if seg.tactic == RenderTactic::Preserve {
                         ops.push(UpdateOp::invalidate(seg.n));
                         b.add_span(seg.n, 0, 0);
-                    }
-                }
-                RenderTactic::Render => {
-                    // TODO: update (rather than re-render) in cases of text valid
-                    if seg.validity == line_cache_shadow::ALL_VALID {
-                        let n_skip = seg.their_line_num - line_num;
-                        if n_skip > 0 {
-                            ops.push(UpdateOp::skip(n_skip));
-                        }
-                        let line_offset = self.offset_of_line(text, seg.our_line_num);
-                        let logical_line = text.line_of_offset(line_offset) + 1;
-                        ops.push(UpdateOp::copy(seg.n, logical_line));
-                        b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
-                        line_num = seg.their_line_num + seg.n;
-                    } else {
+                    } else if seg.tactic == RenderTactic::Render {
                         let start_line = seg.our_line_num;
-                        let rendered_lines = self
+                        let encoded_lines = self
                             .lines
                             .iter_lines(text, start_line)
                             .take(seg.n)
-                            .enumerate()
-                            .map(|(i, l)| {
-                                self.render_line(
+                            .map(|l| {
+                                self.encode_line(
                                     client,
                                     styles,
-                                    text,
                                     l,
-                                    style_spans,
-                                    start_line + i,
+                                    Some(text),
+                                    Some(style_spans),
+                                    text.len(),
                                 )
                             })
                             .collect::<Vec<_>>();
-                        debug_assert_eq!(rendered_lines.len(), seg.n);
-                        ops.push(UpdateOp::insert(rendered_lines));
+                        debug_assert_eq!(encoded_lines.len(), seg.n);
+                        ops.push(UpdateOp::insert(encoded_lines));
                         b.add_span(seg.n, seg.our_line_num, line_cache_shadow::ALL_VALID);
                     }
                 }
@@ -821,21 +880,6 @@ impl View {
         for find in &mut self.find {
             find.set_hls_dirty(false)
         }
-
-        let start_off = self.offset_of_line(text, self.first_line);
-        let end_off = self.offset_of_line(text, self.first_line + self.height + 2);
-        let visible_range = Interval::new(start_off, end_off);
-        let selection_annotations =
-            self.selection.get_annotations(visible_range, &self, text).to_json();
-        let find_annotations =
-            self.find.iter().map(|ref f| f.get_annotations(visible_range, &self, text).to_json());
-        let plugin_annotations =
-            self.annotations.iter_range(&self, text, visible_range).map(|a| a.to_json());
-
-        let annotations = iter::once(selection_annotations)
-            .chain(find_annotations)
-            .chain(plugin_annotations)
-            .collect::<Vec<_>>();
 
         let update = Update { ops, pristine, annotations };
         client.update_view(self.view_id, &update);
@@ -898,60 +942,11 @@ impl View {
         self.lc_shadow = b.build();
     }
 
-    // How should we count "column"? Valid choices include:
-    // * Unicode codepoints
-    // * grapheme clusters
-    // * Unicode width (so CJK counts as 2)
-    // * Actual measurement in text layout
-    // * Code units in some encoding
-    //
-    // Of course, all these are identical for ASCII. For now we use UTF-8 code units
-    // for simplicity.
-
-    pub(crate) fn offset_to_line_col(&self, text: &Rope, offset: usize) -> (usize, usize) {
-        let line = self.line_of_offset(text, offset);
-        (line, offset - self.offset_of_line(text, line))
-    }
-
-    pub(crate) fn line_col_to_offset(&self, text: &Rope, line: usize, col: usize) -> usize {
-        let mut offset = self.offset_of_line(text, line).saturating_add(col);
-        if offset >= text.len() {
-            offset = text.len();
-            if self.line_of_offset(text, offset) <= line {
-                return offset;
-            }
-        } else {
-            // Snap to grapheme cluster boundary
-            offset = text.prev_grapheme_offset(offset + 1).unwrap();
-        }
-
-        // clamp to end of line
-        let next_line_offset = self.offset_of_line(text, line + 1);
-        if offset >= next_line_offset {
-            if let Some(prev) = text.prev_grapheme_offset(next_line_offset) {
-                offset = prev;
-            }
-        }
-        offset
-    }
-
     /// Returns the byte range of the currently visible lines.
     fn interval_of_visible_region(&self, text: &Rope) -> Interval {
         let start = self.offset_of_line(text, self.first_line);
         let end = self.offset_of_line(text, self.first_line + self.height + 1);
         Interval::new(start, end)
-    }
-
-    // use own breaks if present, or text if not (no line wrapping)
-
-    /// Returns the visible line number containing the given offset.
-    pub fn line_of_offset(&self, text: &Rope, offset: usize) -> usize {
-        self.lines.visual_line_of_offset(text, offset)
-    }
-
-    /// Returns the byte offset corresponding to the given visual line.
-    pub fn offset_of_line(&self, text: &Rope, line: usize) -> usize {
-        self.lines.offset_of_visual_line(text, line)
     }
 
     /// Generate line breaks, based on current settings. Currently batch-mode,
@@ -995,6 +990,7 @@ impl View {
         // the front-end, but perhaps not for async edits.
         self.drag_state = None;
 
+        // all annotations that come after the edit need to be invalidated
         let (iv, _) = delta.summary();
         self.annotations.invalidate(iv);
 
@@ -1260,17 +1256,6 @@ impl View {
         self.do_set_replace(replacement.into_owned(), false);
     }
 
-    /// Get the line range of a selected region.
-    pub fn get_line_range(&self, text: &Rope, region: &SelRegion) -> Range<usize> {
-        let (first_line, _) = self.offset_to_line_col(text, region.min());
-        let (mut last_line, last_col) = self.offset_to_line_col(text, region.max());
-        if last_col == 0 && last_line > first_line {
-            last_line -= 1;
-        }
-
-        first_line..(last_line + 1)
-    }
-
     pub fn get_caret_offset(&self) -> Option<usize> {
         match self.selection.len() {
             1 if self.selection[0].is_caret() => {
@@ -1293,6 +1278,16 @@ impl View {
         let client = Client::new(Box::new(DummyPeer));
         self.update_wrap_settings(text, cols, false);
         self.rewrap(text, &mut width_cache, &client, &spans);
+    }
+}
+
+impl LineOffset for View {
+    fn offset_of_line(&self, text: &Rope, line: usize) -> usize {
+        self.lines.offset_of_visual_line(text, line)
+    }
+
+    fn line_of_offset(&self, text: &Rope, offset: usize) -> usize {
+        self.lines.visual_line_of_offset(text, offset)
     }
 }
 

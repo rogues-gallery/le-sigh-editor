@@ -89,10 +89,13 @@ impl<N: NodeInfo> Delta<N> {
     }
 
     /// Returns `true` if this delta represents a single deletion without
-    /// any insertions. Note that this is `false` for the trivial delta.
+    /// any insertions.
+    ///
+    /// Note that this is `false` for the trivial delta, as well as for a deletion
+    /// from an empty `Rope`.
     pub fn is_simple_delete(&self) -> bool {
-        if self.els.is_empty() && self.base_len > 0 {
-            return true;
+        if self.els.is_empty() {
+            return self.base_len > 0;
         }
         if let DeltaElement::Copy(beg, end) = self.els[0] {
             if beg == 0 {
@@ -116,13 +119,16 @@ impl<N: NodeInfo> Delta<N> {
 
     /// Returns `true` if applying the delta will cause no change.
     pub fn is_identity(&self) -> bool {
-        if self.els.len() == 1 {
+        let len = self.els.len();
+        // Case 1: Everything from beginning to end is getting copied.
+        if len == 1 {
             if let DeltaElement::Copy(beg, end) = self.els[0] {
                 return beg == 0 && end == self.base_len;
             }
         }
 
-        false
+        // Case 2: The rope is empty and the entire rope is getting deleted.
+        len == 0 && self.base_len == 0
     }
 
     /// Apply the delta to the given rope. May not work well if the length of the rope
@@ -132,7 +138,7 @@ impl<N: NodeInfo> Delta<N> {
         let mut b = TreeBuilder::new();
         for elem in &self.els {
             match *elem {
-                DeltaElement::Copy(beg, end) => base.push_subseq(&mut b, Interval::new(beg, end)),
+                DeltaElement::Copy(beg, end) => b.push_slice(base, Interval::new(beg, end)),
                 DeltaElement::Insert(ref n) => b.push(n.clone()),
             }
         }
@@ -207,6 +213,9 @@ impl<N: NodeInfo> Delta<N> {
     ///     assert_eq!(String::from(d2.apply(r)), String::from(d.apply(r)));
     /// }
     /// ```
+    // For if last_old.is_some() && last_old.unwrap().0 <= beg {. Clippy complaints
+    // about not using if-let, but that'd change the meaning of the conditional.
+    #[allow(clippy::unnecessary_unwrap)]
     pub fn synthesize(tombstones: &Node<N>, from_dels: &Subset, to_dels: &Subset) -> Delta<N> {
         let base_len = from_dels.len_after_delete();
         let mut els = Vec::new();
@@ -376,6 +385,7 @@ where
 }
 
 impl<N: NodeInfo> InsertDelta<N> {
+    #![allow(clippy::many_single_char_names)]
     /// Do a coordinate transformation on an insert-only delta. The `after` parameter
     /// controls whether the insertions in `self` come after those specific in the
     /// coordinate transform.
@@ -543,10 +553,8 @@ impl<'a, N: NodeInfo + 'a> Transformer<'a, N> {
                             if iv.is_after(beg) {
                                 return true;
                             }
-                        } else {
-                            if !iv.is_before(beg) {
-                                return true;
-                            }
+                        } else if !iv.is_before(beg) {
+                            return true;
                         }
                     } else {
                         return false;
@@ -825,6 +833,9 @@ mod tests {
         let d = Delta::simple_edit(10..12, Rope::from("+"), TEST_STR.len());
         assert_eq!(false, d.is_simple_delete());
 
+        let d = Delta::simple_edit(Interval::new(0, 0), Rope::from(""), 0);
+        assert_eq!(false, d.is_simple_delete());
+
         let d = Delta::simple_edit(Interval::new(10, 11), Rope::from(""), TEST_STR.len());
         assert_eq!(true, d.is_simple_delete());
 
@@ -856,6 +867,9 @@ mod tests {
         assert_eq!(false, d.is_identity());
 
         let d = Delta::simple_edit(0..0, Rope::from(""), TEST_STR.len());
+        assert_eq!(true, d.is_identity());
+
+        let d = Delta::simple_edit(0..0, Rope::from(""), 0);
         assert_eq!(true, d.is_identity());
     }
 

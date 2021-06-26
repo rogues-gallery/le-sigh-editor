@@ -24,7 +24,6 @@ use crate::rope::RopeInfo;
 use crate::tree::Cursor;
 use regex::Regex;
 use std::borrow::Cow;
-use std::iter::FromIterator;
 use std::str;
 
 /// The result of a [`find`][find] operation.
@@ -130,7 +129,7 @@ pub fn find_progress(
                         // 0xE2 is first utf-8 byte of u+212A (kelvin sign)
                         let scanner = |s: &str| memchr3(b'k', b'K', 0xE2, s.as_bytes());
                         find_progress_iter(cursor, lines, &pat_lower, scanner, matcher, num_steps)
-                    } else if b >= b'a' && b <= b'z' {
+                    } else if (b'a'..=b'z').contains(&b) {
                         let scanner = |s: &str| memchr2(b, b - 0x20, s.as_bytes());
                         find_progress_iter(cursor, lines, &pat_lower, scanner, matcher, num_steps)
                     } else if b < 0x80 {
@@ -289,7 +288,7 @@ pub fn compare_cursor_regex(
 
     if is_multiline_regex(pat) {
         // consume all of the text if regex is multi line matching
-        text = Cow::from(String::from_iter(lines));
+        text = Cow::Owned(lines.collect());
     } else {
         match lines.next() {
             Some(line) => text = line,
@@ -483,10 +482,7 @@ mod tests {
             .case_insensitive(true)
             .build()
             .ok();
-        assert_eq!(
-            find(&mut c, &mut raw_lines, CaseInsensitive, "老虎", regex.as_ref()),
-            Some(6)
-        );
+        assert_eq!(find(&mut c, &mut raw_lines, CaseInsensitive, "老虎", regex.as_ref()), Some(6));
         raw_lines = a.lines_raw(c.pos()..a.len());
         assert_eq!(find(&mut c, &mut raw_lines, CaseInsensitive, "老虎", regex.as_ref()), None);
         c.set(0);
@@ -585,10 +581,7 @@ mod tests {
             .case_insensitive(false)
             .build()
             .ok();
-        assert_eq!(
-            find(&mut c, &mut raw_lines, Exact, "\\sLéopard\n.*", regex.as_ref()),
-            Some(12)
-        );
+        assert_eq!(find(&mut c, &mut raw_lines, Exact, "\\sLéopard\n.*", regex.as_ref()), Some(12));
     }
 
     #[test]

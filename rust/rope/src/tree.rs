@@ -14,7 +14,7 @@
 
 //! A general b-tree structure suitable for ropes and the like.
 
-use std::cmp::min;
+use std::cmp::{min, Ordering};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -202,11 +202,22 @@ impl<N: NodeInfo> Node<N> {
         Node(Arc::new(NodeBody { height: 0, len, info, val: NodeVal::Leaf(l) }))
     }
 
+    /// Create a node from a vec of nodes.
+    ///
+    /// The input must satisfy the following balancing requirements:
+    /// * The length of `nodes` must be <= MAX_CHILDREN and > 1.
+    /// * All the nodes are the same height.
+    /// * All the nodes must satisfy is_ok_child.
     fn from_nodes(nodes: Vec<Node<N>>) -> Node<N> {
+        debug_assert!(nodes.len() > 1);
+        debug_assert!(nodes.len() <= MAX_CHILDREN);
         let height = nodes[0].0.height + 1;
         let mut len = nodes[0].0.len;
         let mut info = nodes[0].0.info.clone();
+        debug_assert!(nodes[0].is_ok_child());
         for child in &nodes[1..] {
+            debug_assert_eq!(child.height() + 1, height);
+            debug_assert!(child.is_ok_child());
             len += child.0.len;
             info.accumulate(&child.0.info);
         }
@@ -219,6 +230,14 @@ impl<N: NodeInfo> Node<N> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Returns `true` if these two `Node`s share the same underlying data.
+    ///
+    /// This is principally intended to be used by the druid crate, without needing
+    /// to actually add a feature and implement druid's `Data` trait.
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     fn height(&self) -> usize {
@@ -246,6 +265,22 @@ impl<N: NodeInfo> Node<N> {
             l
         } else {
             panic!("get_leaf called on internal node");
+        }
+    }
+
+    /// Call a callback with a mutable reference to a leaf.
+    ///
+    /// This clones the leaf if the reference is shared. It also recomputes
+    /// length and info after the leaf is mutated.
+    fn with_leaf_mut<T>(&mut self, f: impl FnOnce(&mut N::L) -> T) -> T {
+        let inner = Arc::make_mut(&mut self.0);
+        if let NodeVal::Leaf(ref mut l) = inner.val {
+            let result = f(l);
+            inner.len = l.len();
+            inner.info = N::compute_info(l);
+            result
+        } else {
+            panic!("with_leaf_mut called on internal node");
         }
     }
 
@@ -297,8 +332,6 @@ impl<N: NodeInfo> Node<N> {
     }
 
     pub fn concat(rope1: Node<N>, rope2: Node<N>) -> Node<N> {
-        use std::cmp::Ordering;
-
         let h1 = rope1.height();
         let h2 = rope2.height();
 
@@ -344,39 +377,10 @@ impl<N: NodeInfo> Node<N> {
         M::measure(&self.0.info, self.0.len)
     }
 
-    pub(crate) fn push_subseq(&self, b: &mut TreeBuilder<N>, iv: Interval) {
-        if iv.is_empty() {
-            return;
-        }
-        if iv == self.interval() {
-            b.push(self.clone());
-            return;
-        }
-        match self.0.val {
-            NodeVal::Leaf(ref l) => {
-                b.push_leaf_slice(l, iv);
-            }
-            NodeVal::Internal(ref v) => {
-                let mut offset = 0;
-                for child in v {
-                    if iv.is_before(offset) {
-                        break;
-                    }
-                    let child_iv = child.interval();
-                    // easier just to use signed ints?
-                    let rec_iv = iv.intersect(child_iv.translate(offset)).translate_neg(offset);
-                    child.push_subseq(b, rec_iv);
-                    offset += child.len();
-                }
-                return;
-            }
-        }
-    }
-
     pub fn subseq<T: IntervalBounds>(&self, iv: T) -> Node<N> {
         let iv = iv.into_interval(self.len());
         let mut b = TreeBuilder::new();
-        self.push_subseq(&mut b, iv);
+        b.push_slice(self, iv);
         b.build()
     }
 
@@ -388,9 +392,9 @@ impl<N: NodeInfo> Node<N> {
         let mut b = TreeBuilder::new();
         let iv = iv.into_interval(self.len());
         let self_iv = self.interval();
-        self.push_subseq(&mut b, self_iv.prefix(iv));
+        b.push_slice(self, self_iv.prefix(iv));
         b.push(new.into());
-        self.push_subseq(&mut b, self_iv.suffix(iv));
+        b.push_slice(self, self_iv.suffix(iv));
         *self = b.build();
     }
 
@@ -465,71 +469,154 @@ impl<N: NodeInfo> Default for Node<N> {
     }
 }
 
-pub struct TreeBuilder<N: NodeInfo>(Option<Node<N>>);
+/// A builder for creating new trees.
+pub struct TreeBuilder<N: NodeInfo> {
+    // A stack of partially built trees. These are kept in order of
+    // strictly descending height, and all vectors have a length less
+    // than MAX_CHILDREN and greater than zero.
+    //
+    // In addition, there is a balancing invariant: for each vector
+    // of length greater than one, all elements satisfy `is_ok_child`.
+    stack: Vec<Vec<Node<N>>>,
+}
 
 impl<N: NodeInfo> TreeBuilder<N> {
+    /// A new, empty builder.
     pub fn new() -> TreeBuilder<N> {
-        TreeBuilder(None)
+        TreeBuilder { stack: Vec::new() }
     }
 
-    /// Push a node on the accumulating tree by concatenating it.
-    ///
-    /// This method is O(log n), where `n` is the amount of nodes already in the accumulating tree.
-    /// The worst case happens when all nodes having exactly MAX_CHILDREN children
-    /// and the node being pushed is a leaf or equivalently has height 1.
-    /// Then `log n` nodes have to be created before the leaf can be added, to keep all leaves on the same height.
-    pub fn push(&mut self, n: Node<N>) {
-        match self.0.take() {
-            None => self.0 = Some(n),
-            Some(buf) => self.0 = Some(Node::concat(buf, n)),
-        }
-    }
-
-    /// Add leaves to accumulating tree.
-    ///
-    /// Creates a stack of node lists, where all the nodes in a list have uniform node height.
-    /// The stack is height sorted in ascending order.
-    /// The length of any list in the stack is at most MAX_CHILDREN -1.
-    ///
-    /// Example of this kind of stack if MAX_CHILDREN = 3:
-    /// let n_i be some node of height i. Let the front of the array represent the top of the stack.
-    /// `[[n_1, n_1], [n_2], [n_3, n_3]]`
-    ///
-    /// The nodes in the stack are pushed on the accumulating tree one by one in the end.
-    pub fn push_leaves(&mut self, leaves: Vec<N::L>) {
-        let mut stack: Vec<Vec<Node<N>>> = Vec::new();
-        for leaf in leaves {
-            let mut new = Node::from_leaf(leaf);
-            loop {
-                if stack.last().map_or(true, |r| r[0].height() != new.height()) {
-                    stack.push(Vec::new());
+    /// Append a node to the tree being built.
+    pub fn push(&mut self, mut n: Node<N>) {
+        loop {
+            let ord = if let Some(last) = self.stack.last() {
+                last[0].height().cmp(&n.height())
+            } else {
+                Ordering::Greater
+            };
+            match ord {
+                Ordering::Less => {
+                    n = Node::concat(self.pop(), n);
                 }
-                stack.last_mut().unwrap().push(new);
-                if stack.last().unwrap().len() < MAX_CHILDREN {
+                Ordering::Equal => {
+                    let tos = self.stack.last_mut().unwrap();
+                    if tos.last().unwrap().is_ok_child() && n.is_ok_child() {
+                        tos.push(n);
+                    } else if n.height() == 0 {
+                        let iv = Interval::new(0, n.len());
+                        let new_leaf = tos
+                            .last_mut()
+                            .unwrap()
+                            .with_leaf_mut(|l| l.push_maybe_split(n.get_leaf(), iv));
+                        if let Some(new_leaf) = new_leaf {
+                            tos.push(Node::from_leaf(new_leaf));
+                        }
+                    } else {
+                        let last = tos.pop().unwrap();
+                        let children1 = last.get_children();
+                        let children2 = n.get_children();
+                        let n_children = children1.len() + children2.len();
+                        if n_children <= MAX_CHILDREN {
+                            tos.push(Node::from_nodes([children1, children2].concat()));
+                        } else {
+                            // Note: this leans left. Splitting at midpoint is also an option
+                            let splitpoint = min(MAX_CHILDREN, n_children - MIN_CHILDREN);
+                            let mut iter = children1.iter().chain(children2.iter()).cloned();
+                            let left = iter.by_ref().take(splitpoint).collect();
+                            let right = iter.collect();
+                            tos.push(Node::from_nodes(left));
+                            tos.push(Node::from_nodes(right));
+                        }
+                    }
+                    if tos.len() < MAX_CHILDREN {
+                        break;
+                    }
+                    n = self.pop()
+                }
+                Ordering::Greater => {
+                    self.stack.push(vec![n]);
                     break;
                 }
-                new = Node::from_nodes(stack.pop().unwrap())
-            }
-        }
-        for v in stack {
-            for r in v {
-                self.push(r)
             }
         }
     }
 
+    /// Push a subsequence of a rope.
+    ///
+    /// Pushes the subsequence of another tree `n` defined by the interval `iv`
+    /// onto the builder.
+    ///
+    /// This is intended as an efficient operation. It is equivalent to taking
+    /// the subsequence of `n` and pushing that, but attempts to minimize the
+    /// allocation of intermediate results.
+    pub fn push_slice(&mut self, n: &Node<N>, iv: Interval) {
+        if iv.is_empty() {
+            return;
+        }
+        if iv == n.interval() {
+            self.push(n.clone());
+            return;
+        }
+        match n.0.val {
+            NodeVal::Leaf(ref l) => {
+                self.push_leaf_slice(l, iv);
+            }
+            NodeVal::Internal(ref v) => {
+                let mut offset = 0;
+                for child in v {
+                    if iv.is_before(offset) {
+                        break;
+                    }
+                    let child_iv = child.interval();
+                    // easier just to use signed ints?
+                    let rec_iv = iv.intersect(child_iv.translate(offset)).translate_neg(offset);
+                    self.push_slice(child, rec_iv);
+                    offset += child.len();
+                }
+            }
+        }
+    }
+
+    /// Append a sequence of leaves.
+    pub fn push_leaves(&mut self, leaves: impl IntoIterator<Item = N::L>) {
+        for leaf in leaves.into_iter() {
+            self.push(Node::from_leaf(leaf));
+        }
+    }
+
+    /// Append a single leaf.
     pub fn push_leaf(&mut self, l: N::L) {
         self.push(Node::from_leaf(l))
     }
 
+    /// Append a slice of a single leaf.
     pub fn push_leaf_slice(&mut self, l: &N::L, iv: Interval) {
         self.push(Node::from_leaf(l.subseq(iv)))
     }
 
-    pub fn build(self) -> Node<N> {
-        match self.0 {
-            Some(r) => r,
-            None => Node::from_leaf(N::L::default()),
+    /// Build the final tree.
+    ///
+    /// The tree is the concatenation of all the nodes and leaves that have been pushed
+    /// on the builder, in order.
+    pub fn build(mut self) -> Node<N> {
+        if self.stack.is_empty() {
+            Node::from_leaf(N::L::default())
+        } else {
+            let mut n = self.pop();
+            while !self.stack.is_empty() {
+                n = Node::concat(self.pop(), n);
+            }
+            n
+        }
+    }
+
+    /// Pop the last vec-of-nodes off the stack, resulting in a node.
+    fn pop(&mut self) -> Node<N> {
+        let nodes = self.stack.pop().unwrap();
+        if nodes.len() == 1 {
+            nodes.into_iter().next().unwrap()
+        } else {
+            Node::from_nodes(nodes)
         }
     }
 }
@@ -655,7 +742,7 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
     /// When there is no previous boundary, returns `None` and the cursor becomes invalid.
     ///
     /// Return value: the position of the boundary, if it exists.
-    pub fn prev<M: Metric<N>>(&mut self) -> Option<(usize)> {
+    pub fn prev<M: Metric<N>>(&mut self) -> Option<usize> {
         if self.position == 0 || self.leaf.is_none() {
             self.leaf = None;
             return None;
@@ -692,7 +779,7 @@ impl<'a, N: NodeInfo> Cursor<'a, N> {
     /// When there is no next boundary, returns `None` and the cursor becomes invalid.
     ///
     /// Return value: the position of the boundary, if it exists.
-    pub fn next<M: Metric<N>>(&mut self) -> Option<(usize)> {
+    pub fn next<M: Metric<N>>(&mut self) -> Option<usize> {
         if self.position >= self.root.len() || self.leaf.is_none() {
             self.leaf = None;
             return None;
@@ -996,16 +1083,20 @@ mod test {
     }
 
     #[test]
-    fn eq_rope_with_stack() {
+    fn eq_rope_with_pieces() {
         let n = 2_000;
         let s = build_triangle(n);
         let mut builder_default = TreeBuilder::new();
-        let mut builder_stacked = TreeBuilder::new();
+        let mut concat_rope = Rope::default();
         builder_default.push_str(&s);
-        builder_stacked.push_str_stacked(&s);
-        let tree_default = builder_default.build();
-        let tree_stacked = builder_stacked.build();
-        assert_eq!(tree_default, tree_stacked);
+        let mut i = 0;
+        while i < s.len() {
+            let j = (i + 1000).min(s.len());
+            concat_rope = concat_rope + s[i..j].into();
+            i = j;
+        }
+        let built_rope = builder_default.build();
+        assert_eq!(built_rope, concat_rope);
     }
 
     #[test]
@@ -1182,5 +1273,14 @@ mod test {
         }
 
         assert_eq!(None, cursor.prev::<LinesMetric>());
+    }
+
+    #[test]
+    fn balance_invariant() {
+        let mut tb = TreeBuilder::<RopeInfo>::new();
+        let leaves: Vec<String> = (0..1000).map(|i| i.to_string().into()).collect();
+        tb.push_leaves(leaves);
+        let tree = tb.build();
+        println!("height {}", tree.height());
     }
 }

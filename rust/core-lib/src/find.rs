@@ -18,6 +18,7 @@ use std::cmp::{max, min};
 use std::iter;
 
 use crate::annotations::{AnnotationRange, AnnotationSlice, AnnotationType, ToAnnotation};
+use crate::line_offset::LineOffset;
 use crate::selection::{InsertDrift, SelRegion, Selection};
 use crate::view::View;
 use crate::word_boundaries::WordCursor;
@@ -149,7 +150,7 @@ impl Find {
                 // also invalidate previous occurrence since it might expand after insertion
                 // eg. for regex .* every insertion after match will be part of match
                 self.occurrences.delete_range(
-                    new_offset.checked_sub(1).unwrap_or(0),
+                    new_offset.saturating_sub(1),
                     new_offset + len,
                     false,
                 );

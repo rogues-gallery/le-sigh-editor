@@ -15,8 +15,10 @@
 //! A rope data structure with a line count metric and (soon) other useful
 //! info.
 
+#![allow(clippy::needless_return)]
+
 use std::borrow::Cow;
-use std::cmp::{max, min};
+use std::cmp::{max, min, Ordering};
 use std::fmt;
 use std::ops::Add;
 use std::str::{self, FromStr};
@@ -26,11 +28,8 @@ use crate::delta::{Delta, DeltaElement};
 use crate::interval::{Interval, IntervalBounds};
 use crate::tree::{Cursor, DefaultMetric, Leaf, Metric, Node, NodeInfo, TreeBuilder};
 
-use bytecount;
 use memchr::{memchr, memrchr};
-
-use unicode_segmentation::GraphemeCursor;
-use unicode_segmentation::GraphemeIncomplete;
+use unicode_segmentation::{GraphemeCursor, GraphemeIncomplete};
 
 const MIN_LEAF: usize = 511;
 const MAX_LEAF: usize = 1024;
@@ -477,12 +476,15 @@ impl Rope {
     /// Callers are expected to validate their input.
     pub fn offset_of_line(&self, line: usize) -> usize {
         let max_line = self.measure::<LinesMetric>() + 1;
-        if line > max_line {
-            panic!("line number {} beyond last line {}", line, max_line);
-        } else if line == max_line {
-            return self.len();
+        match line.cmp(&max_line) {
+            Ordering::Greater => {
+                panic!("line number {} beyond last line {}", line, max_line);
+            }
+            Ordering::Equal => {
+                return self.len();
+            }
+            Ordering::Less => self.count_base_units::<LinesMetric>(line),
         }
-        self.count_base_units::<LinesMetric>(line)
     }
 
     /// Returns an iterator over chunks of the rope.
@@ -576,7 +578,8 @@ impl TreeBuilder<RopeInfo> {
     /// Push a string on the accumulating tree in the naive way.
     ///
     /// Splits the provided string in chunks that fit in a leaf
-    /// and pushes the leaves one by one onto the tree by calling.
+    /// and pushes the leaves one by one onto the tree by calling
+    /// `push_leaf` on the builder.
     pub fn push_str(&mut self, mut s: &str) {
         if s.len() <= MAX_LEAF {
             if !s.is_empty() {
@@ -590,28 +593,6 @@ impl TreeBuilder<RopeInfo> {
             s = &s[splitpoint..];
         }
     }
-
-    /// Push a string on the accumulating tree in an optimized fashion.
-    ///
-    /// Splits the string into leaves first and
-    /// then pushes all the leaves onto the accumulating tree in one go.
-    ///
-    /// Note: this is only used in tests.
-    #[doc(hidden)]
-    pub fn push_str_stacked(&mut self, s: &str) {
-        let leaves = split_as_leaves(s);
-        self.push_leaves(leaves);
-    }
-}
-
-fn split_as_leaves(mut s: &str) -> Vec<String> {
-    let mut nodes = Vec::new();
-    while !s.is_empty() {
-        let splitpoint = if s.len() > MAX_LEAF { find_leaf_split_for_bulk(s) } else { s.len() };
-        nodes.push(s[..splitpoint].to_owned());
-        s = &s[splitpoint..];
-    }
-    nodes
 }
 
 impl<T: AsRef<str>> From<T> for Rope {
@@ -652,7 +633,7 @@ impl fmt::Debug for Rope {
     }
 }
 
-impl Add<Rope> for Rope {
+impl Add for Rope {
     type Output = Rope;
     fn add(self, rhs: Rope) -> Rope {
         let mut b = TreeBuilder::new();

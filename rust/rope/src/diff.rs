@@ -65,6 +65,18 @@ impl Diff<RopeInfo> for LineHashDiff {
             return builder.to_delta(base, target);
         }
 
+        // if a continuous range of text got deleted, we're done
+        if target.len() < base.len() && start_offset + diff_end == target.len() {
+            builder.copy(base.len() - diff_end, target_end, diff_end);
+            return builder.to_delta(base, target);
+        }
+
+        // if a continuous range of text got inserted, we're done
+        if target.len() > base.len() && start_offset + diff_end == base.len() {
+            builder.copy(base.len() - diff_end, target_end, diff_end);
+            return builder.to_delta(base, target);
+        }
+
         let line_hashes = make_line_hashes(&base, MIN_SIZE);
 
         let line_count = target.measure::<LinesMetric>() + 1;
@@ -247,7 +259,7 @@ impl DiffBuilder {
 
 /// Creates a map of lines to offsets, ignoring trailing whitespace, and only for those lines
 /// where line.len() >= min_size. Offsets refer to the first non-whitespace byte in the line.
-fn make_line_hashes<'a>(base: &'a Rope, min_size: usize) -> HashMap<Cow<'a, str>, usize> {
+fn make_line_hashes(base: &Rope, min_size: usize) -> HashMap<Cow<str>, usize> {
     let mut offset = 0;
     let mut line_hashes = HashMap::with_capacity(base.len() / 60);
     for line in base.lines_raw(..) {
@@ -295,6 +307,24 @@ Currently my sense of smell (and the pain of implementing Write) might be too mu
 
         let result = delta.apply(&one);
         assert_eq!(result, two);
+    }
+
+    #[test]
+    fn simple_diff() {
+        let one = "This is a simple string".into();
+        let two = "This is a string".into();
+
+        let delta = LineHashDiff::compute_delta(&one, &two);
+        println!("delta: {:?}", &delta);
+
+        let result = delta.apply(&one);
+        assert_eq!(result, two);
+
+        let delta = LineHashDiff::compute_delta(&two, &one);
+        println!("delta: {:?}", &delta);
+
+        let result = delta.apply(&two);
+        assert_eq!(result, one);
     }
 
     #[test]

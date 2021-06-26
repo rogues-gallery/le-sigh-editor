@@ -28,7 +28,6 @@
 //! `Engine::merge`, which is more powerful but considerably more complex.
 //! It enables support for full asynchronous and even peer-to-peer editing.
 
-use std;
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeSet;
@@ -327,7 +326,7 @@ impl Engine {
     /// A delta that, when applied to `base_rev`, results in the current head. Returns
     /// an error if there is not at least one edit.
     pub fn try_delta_rev_head(&self, base_rev: RevToken) -> Result<Delta<RopeInfo>, Error> {
-        let ix = self.find_rev_token(base_rev).ok_or_else(|| Error::MissingRevision(base_rev))?;
+        let ix = self.find_rev_token(base_rev).ok_or(Error::MissingRevision(base_rev))?;
         let prev_from_union = self.deletes_from_cur_union_for_index(ix);
         // TODO: this does 2 calls to Delta::synthesize and 1 to apply, this probably could be better.
         let old_tombstones = shuffle_tombstones(
@@ -352,7 +351,7 @@ impl Engine {
         base_rev: RevToken,
         delta: Delta<RopeInfo>,
     ) -> Result<(Revision, Rope, Rope, Subset), Error> {
-        let ix = self.find_rev_token(base_rev).ok_or_else(|| Error::MissingRevision(base_rev))?;
+        let ix = self.find_rev_token(base_rev).ok_or(Error::MissingRevision(base_rev))?;
 
         let (ins_delta, deletes) = delta.factor();
 
@@ -488,10 +487,10 @@ impl Engine {
                     return i + 1; // +1 since we know the one we just found doesn't have it
                 }
             }
-            return 0;
+            0
         } else {
             // no toggled groups, return past end
-            return self.revs.len();
+            self.revs.len()
         }
     }
 
@@ -607,7 +606,7 @@ impl Engine {
             self.tombstones = dels_from_tombstones.delete_from(&self.tombstones);
             self.deletes_from_union = self.deletes_from_union.transform_shrink(&gc_dels);
         }
-        let old_revs = std::mem::replace(&mut self.revs, Vec::new());
+        let old_revs = std::mem::take(&mut self.revs);
         for rev in old_revs.into_iter().rev() {
             match rev.edit {
                 Edit { priority, undo_group, inserts, deletes } => {

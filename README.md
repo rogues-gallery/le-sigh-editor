@@ -7,7 +7,13 @@
 
 <h4 align="center">A modern editor with a backend written in Rust.</h4>
 
-***Note:*** *This is repo contains only the editor core, which is not usable on its own. For editors based on it, check out the list in [Frontends](#frontends).*
+***Maintenance status:*** *The xi-editor project is not currently under active
+development. Although we will happily accept bug fixes, no new features are
+currently planned. We would like to revisit writing a text editor again at
+some point in the future, but for the time being our attention is elsewhere.*
+— The Editors
+
+***Note:*** *This repo contains only the editor core, which is not usable on its own. For editors based on it, check out the list in [Frontends](#frontends).*
 
 The xi-editor project is an attempt to build a high quality text editor,
 using modern software engineering techniques. It is initially built for
@@ -32,7 +38,7 @@ Goals include:
 **Learn more** with the creator of Xi, Raph Levien, in this [Recurse Center Localhost talk](https://www.recurse.com/events/localhost-raph-levien
 ).
 
-Screenshot (will need to be updated as syntax coloring and UI polish is added):
+Screenshot:
 
 ![xi-mac screenshot](/docs/docs/img/xi-mac-screenshot.png?raw=true)
 
@@ -46,7 +52,7 @@ below.
 ### Building the core
 
 Xi-editor targets 'recent stable Rust'. We recommend installing via [rustup](https://www.rustup.rs).
-The current minimum supported version is 1.31.
+The current minimum supported version is 1.40.
 
 To build the xi-editor core from the root directory of this repo:
 
@@ -61,8 +67,6 @@ To build the xi-editor core from the root directory of this repo:
 Here are some front-ends in various stages of development:
 
 * [xi-mac](https://github.com/xi-editor/xi-mac), the official macOS front-end.
-
-* [fuchsia/xi](https://fuchsia.googlesource.com/topaz/+/master/bin/xi/), a front-end in Flutter for Fuchsia.
 
 * [xi-gtk](https://github.com/eyelash/xi-gtk), a GTK+ front-end.
 

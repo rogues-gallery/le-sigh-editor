@@ -20,6 +20,7 @@ use std::ops::Deref;
 
 use crate::annotations::{AnnotationRange, AnnotationSlice, AnnotationType, ToAnnotation};
 use crate::index_set::remove_n_at;
+use crate::line_offset::LineOffset;
 use crate::view::View;
 use xi_rope::{Interval, Rope, RopeDelta, Transformer};
 
@@ -102,7 +103,7 @@ impl Selection {
         let mut end_ix = ix;
         if self.regions[ix].min() <= region.min() {
             if self.regions[ix].should_merge(region) {
-                region = self.regions[ix].merge_with(region);
+                region = region.merge_with(self.regions[ix]);
             } else {
                 ix += 1;
             }
@@ -161,6 +162,7 @@ impl Selection {
     /// case, the new region is either not added at all, because there is an ambiguous region with
     /// a lower start position, or existing regions that intersect with the new region but do
     /// not start before the new region, are deleted.
+    #[allow(clippy::suspicious_operation_groupings)]
     pub fn add_range_distinct(&mut self, region: SelRegion) -> (usize, usize) {
         let mut ix = self.search(region.min());
 
@@ -337,13 +339,16 @@ impl SelRegion {
 
     // Indicate whether this region should merge with the next.
     // Assumption: regions are sorted (self.min() <= other.min())
+    #[allow(clippy::suspicious_operation_groupings)] // clippy doesn't like comparing min() to max()
     fn should_merge(self, other: SelRegion) -> bool {
         other.min() < self.max()
             || ((self.is_caret() || other.is_caret()) && other.min() == self.max())
     }
 
+    // Merge self with an overlapping region.
+    // Retains direction of self.
     fn merge_with(self, other: SelRegion) -> SelRegion {
-        let is_forward = self.end > self.start || other.end > other.start;
+        let is_forward = self.end >= self.start;
         let new_min = min(self.min(), other.min());
         let new_max = max(self.max(), other.max());
         let (start, end) = if is_forward { (new_min, new_max) } else { (new_max, new_min) };
@@ -494,6 +499,8 @@ mod tests {
         assert_eq!(s.deref(), &[r(1, 3), r(3, 6), r(7, 9)]);
         s.add_region(r(2, 8));
         assert_eq!(s.deref(), &[r(1, 9)]);
+        s.add_region(r(10, 8));
+        assert_eq!(s.deref(), &[r(10, 1)]);
 
         s.clear();
         assert_eq!(s.deref(), &[]);

@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use serde::de::{self, Deserialize};
 use serde_json::{self, Value};
-use toml;
 
 use crate::syntax::{LanguageId, Languages};
 use crate::tabs::{BufferId, ViewId};
@@ -285,7 +284,8 @@ impl ConfigManager {
     ///
     /// Panics if `id` already exists.
     pub(crate) fn add_buffer(&mut self, id: BufferId, path: Option<&Path>) -> Table {
-        let lang = path.and_then(|p| self.language_for_path(p)).unwrap_or_default();
+        let lang =
+            path.and_then(|p| self.language_for_path(p)).unwrap_or(LanguageId::from("Plain Text"));
         let lang_tag = LanguageTag::new(lang);
         assert!(self.buffer_tags.insert(id, lang_tag).is_none());
         self.update_buffer_config(id).expect("new buffer must always have config")
@@ -363,9 +363,8 @@ impl ConfigManager {
             .map(LanguageTag::resolve)
             .and_then(|name| self.languages.language_for_name(name))
             .map(|l| l.name.clone());
-        let mut configs = Vec::new();
+        let mut configs = vec![self.configs.get(&ConfigDomain::General)];
 
-        configs.push(self.configs.get(&ConfigDomain::General));
         if let Some(s) = lang {
             configs.push(self.configs.get(&s.into()))
         };
@@ -464,10 +463,7 @@ impl ConfigManager {
         config: Table,
     ) -> Result<Vec<(BufferId, Table)>, ConfigError> {
         self.check_table(&config)?;
-        self.configs
-            .entry(domain.clone())
-            .or_insert_with(|| ConfigPair::with_base(None))
-            .set_table(config);
+        self.configs.entry(domain).or_insert_with(|| ConfigPair::with_base(None)).set_table(config);
         Ok(self.update_all_buffer_configs())
     }
 
@@ -492,7 +488,7 @@ impl ConfigManager {
     /// from disk.
     pub(crate) fn table_for_update(&mut self, domain: ConfigDomain, changes: Table) -> Table {
         self.configs
-            .entry(domain.clone())
+            .entry(domain)
             .or_insert_with(|| ConfigPair::with_base(None))
             .table_for_update(changes)
     }
@@ -696,25 +692,15 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::ConfigError::*;
         match *self {
-            UnknownDomain(ref s) => write!(f, "{}: {}", self.description(), s),
-            Parse(ref p, ref e) => write!(f, "{} ({:?}), {:?}", self.description(), p, e),
-            Io(ref e) => write!(f, "error loading config: {:?}", e),
+            UnknownDomain(ref s) => write!(f, "UnknownDomain: {}", s),
+            Parse(ref p, ref e) => write!(f, "Parse ({:?}), {}", p, e),
+            Io(ref e) => write!(f, "error loading config: {}", e),
             UnexpectedItem(ref e) => write!(f, "{}", e),
         }
     }
 }
 
-impl Error for ConfigError {
-    fn description(&self) -> &str {
-        use self::ConfigError::*;
-        match *self {
-            UnknownDomain(..) => "unknown domain",
-            Parse(_, ref e) => e.description(),
-            Io(ref e) => e.description(),
-            UnexpectedItem(ref e) => e.description(),
-        }
-    }
-}
+impl Error for ConfigError {}
 
 impl From<io::Error> for ConfigError {
     fn from(src: io::Error) -> ConfigError {
@@ -756,7 +742,7 @@ pub(crate) fn table_from_toml_str(s: &str) -> Result<Table, toml::de::Error> {
 /// (used to store config values internally).
 fn from_toml_value(value: toml::Value) -> Value {
     match value {
-        toml::Value::String(value) => value.to_owned().into(),
+        toml::Value::String(value) => value.into(),
         toml::Value::Float(value) => value.into(),
         toml::Value::Integer(value) => value.into(),
         toml::Value::Boolean(value) => value.into(),
